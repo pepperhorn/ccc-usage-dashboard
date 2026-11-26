@@ -127,6 +127,51 @@ class RolloutTests(unittest.TestCase):
                     for pct, stamp in [(20, 10), (30, 20), (90, 5)]]
             self.assertEqual(collector.claude_windows(rows)[0]['usedPercent'], 30)
 
+    def test_windows_kept_separate_per_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = sc.Collector(Path(tmp), Path(tmp))
+            rows = [{'source': 'claude', 'account': acct, 'windows': sc.normalized_windows({'five_hour': {'used_percentage': pct, 'resets_at': 9000}}, 10, 'footer')}
+                    for acct, pct in [('Claude', 20), ('ClaudeCRF', 70)]]
+            result = {w['account']: w['usedPercent'] for w in collector.claude_windows(rows)}
+            self.assertEqual(result, {'Claude': 20, 'ClaudeCRF': 70})
+
+    def test_account_config_parsing_and_default_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual([a['label'] for a in sc.claude_accounts(home, {})], ['Claude'])
+            (home / '.crfclaude').mkdir()
+            (home / '.crfclaude/.claude.json').write_text('{}')
+            accounts = sc.claude_accounts(home, {})
+            self.assertEqual([a['label'] for a in accounts], ['Claude', 'ClaudeCRF'])
+            self.assertEqual(accounts[0]['state'], home / '.claude.json')
+            self.assertEqual(accounts[1]['state'], home / '.crfclaude/.claude.json')
+            env = {'CCC_CLAUDE_CONFIG_DIRS': f'Work={home}/w{sc.os.pathsep}{home}/.crfclaude'}
+            self.assertEqual([a['label'] for a in sc.claude_accounts(home, env)], ['Work', 'ClaudeCRF'])
+            self.assertEqual(sc.account_label_for_env(home, {'CLAUDE_CONFIG_DIR': str(home / '.crfclaude')}), 'ClaudeCRF')
+            self.assertEqual(sc.account_label_for_env(home, {}), 'Claude')
+
+    def test_default_account_prefers_home_state_over_stray_inner_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / '.claude').mkdir()
+            (home / '.claude/.claude.json').write_text('{}')  # Stray file Claude Code does not use without CLAUDE_CONFIG_DIR.
+            (home / '.claude.json').write_text('{}')
+            self.assertEqual(sc.claude_accounts(home, {})[0]['state'], home / '.claude.json')
+
+    def test_sessions_and_usage_cache_scanned_for_each_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            for d in ('.claude', '.crfclaude'):
+                (home / d / 'sessions').mkdir(parents=True)
+                (home / d / 'sessions' / '1.json').write_text(json.dumps({'pid': 1 if d == '.claude' else 2, 'sessionId': 'sid-' + d.strip('.'), 'procStart': 'new'}))
+            (home / '.crfclaude/.claude.json').write_text(json.dumps({'cachedUsageUtilization': {'fetchedAtMs': 5000000, 'utilization': {'five_hour': {'utilization': 40, 'resets_at': 9000000}}}}))
+            collector = sc.Collector(home / 'dashboard', home)
+            with patch.object(sc, 'proc_info', side_effect=lambda pid: {'pid': int(pid), 'comm': 'claude', 'tty': True, 'start': 'new', 'parent': 1} if int(pid) in (1, 2) else None):
+                result = collector.collect(1000)
+            self.assertEqual({r['sessionId']: r['account'] for r in result['sessions']}, {'sid-claude': 'Claude', 'sid-crfclaude': 'ClaudeCRF'})
+            self.assertEqual([(w['account'], w['usedPercent']) for w in result['claudeWindows']], [('ClaudeCRF', 40)])
+            self.assertEqual(result['claudeAccounts'], ['Claude', 'ClaudeCRF'])
+
     def test_pid_reuse_and_headless_registry_are_excluded(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

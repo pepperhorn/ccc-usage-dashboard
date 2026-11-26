@@ -90,6 +90,21 @@ baseline calculation. A compaction clears the reading until subsequent token
 usage arrives. Rollout metadata is version-sensitive and may require adjustment
 on a Codex upgrade.
 
+### Multiple Claude accounts
+
+Set `CCC_CLAUDE_CONFIG_DIRS` (separated by `os.pathsep`, `:` on Linux) to the Claude
+config dirs to scan, with optional labels: `Work=/home/me/.claude-work:/home/me/.crfclaude`.
+The default is `~/.claude` (label `Claude`) plus `~/.crfclaude` (label `ClaudeCRF`) when
+it exists. For each dir the collector reads `projects/`, `sessions/` and the global state
+file (`<dir>/.claude.json`, or `~/.claude.json` for the default `~/.claude`). Sessions and
+subscription windows carry an `account` label, windows are never merged across accounts,
+and the dashboard shows labels only when more than one account is present.
+
+For an account launched with `CLAUDE_CONFIG_DIR`, wrap its `statusLine.command` in that
+dir's `settings.json` the same way as above (e.g. `~/.crfclaude/settings.json`); `capture`
+tags snapshots from `CLAUDE_CONFIG_DIR`. Export `CCC_CLAUDE_CONFIG_DIRS` to both the
+collector and any capture command if you use non-default dirs.
+
 ## Freshness and scope
 
 Claude account limits use the newest reported `rate_limits` snapshot or the

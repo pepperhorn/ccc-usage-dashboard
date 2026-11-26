@@ -49,6 +49,54 @@ def epoch(value):
         return None
 
 
+KNOWN_LABELS = {'.claude': 'Claude', '.crfclaude': 'ClaudeCRF'}
+
+
+def claude_accounts(home=None, env=None):
+    """Claude config dirs from CCC_CLAUDE_CONFIG_DIRS (os.pathsep-separated, optional label=path)."""
+    home = Path(home) if home else Path.home()
+    raw = (os.environ if env is None else env).get('CCC_CLAUDE_CONFIG_DIRS')
+    if raw and raw.strip():
+        entries = [e.strip() for e in raw.split(os.pathsep) if e.strip()]
+    else:
+        entries = [str(home / '.claude')] + ([str(home / '.crfclaude')] if (home / '.crfclaude').is_dir() else [])
+    accounts, seen = [], set()
+    for entry in entries:
+        label, _, path = entry.partition('=')
+        if not path or '/' in label or os.sep in label:
+            label, path = None, entry
+        path = Path(path).expanduser()
+        if not path.is_absolute():
+            path = home / path
+        label = label.strip() if label else (KNOWN_LABELS.get(path.name) or path.name.lstrip('.') or 'Claude')
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        state = path / '.claude.json'
+        if path == home / '.claude' and ((home / '.claude.json').exists() or not state.exists()):
+            # Without CLAUDE_CONFIG_DIR, Claude Code keeps global state beside the dir; an inner file is stray.
+            state = home / '.claude.json'
+        accounts.append({'label': label, 'dir': path, 'state': state})
+    return accounts
+
+
+def account_label_for_env(home=None, env=None):
+    env = os.environ if env is None else env
+    accounts = claude_accounts(home, env)
+    configured = env.get('CLAUDE_CONFIG_DIR')
+    if configured:
+        target = Path(configured).expanduser()
+        for a in accounts:
+            if a['dir'] == target:
+                return a['label']
+        return KNOWN_LABELS.get(target.name) or target.name.lstrip('.') or 'Claude'
+    home = Path(home) if home else Path.home()
+    for a in accounts:
+        if a['dir'] == home / '.claude':
+            return a['label']
+    return accounts[0]['label'] if accounts else 'Claude'
+
+
 def proc_info(pid):
     try:
         p = Path('/proc') / str(int(pid))
@@ -121,7 +169,7 @@ def normalized_windows(limits, observed, origin):
     return windows
 
 
-def footer_snapshot(data, proc, now):
+def footer_snapshot(data, proc, now, account=None):
     sid = data.get('session_id', '')
     if not isinstance(sid, str) or not ID.fullmatch(sid) or not proc or not proc['tty']:
         return None
@@ -135,21 +183,24 @@ def footer_snapshot(data, proc, now):
         if all(n is not None and n >= 0 for n in counts):
             tokens = sum(counts)
     cost = data.get('cost') or {}
+    windows = normalized_windows(data.get('rate_limits'), now, 'Claude footer')
+    for w in windows:
+        w['account'] = account
     return {'source': 'claude', 'sessionId': sid, 'pid': proc['pid'], 'procStart': proc['start'],
-            'name': data.get('session_name'), 'cwd': (data.get('workspace') or {}).get('current_dir') or data.get('cwd'),
+            'account': account, 'name': data.get('session_name'), 'cwd': (data.get('workspace') or {}).get('current_dir') or data.get('cwd'),
             'model': (data.get('model') or {}).get('display_name') or (data.get('model') or {}).get('id'),
             'contextUsedPercent': pct if pct is not None and pct >= 0 else None,
             'contextTokens': tokens, 'contextCapacity': capacity,
             'contextOrigin': 'Claude footer', 'observedAt': now,
             'sessionCostUsd': number(cost.get('total_cost_usd')),
             'durationMs': number(cost.get('total_duration_ms')),
-            'windows': normalized_windows(data.get('rate_limits'), now, 'Claude footer')}
+            'windows': windows}
 
 
 def capture(command):
     raw = sys.stdin.buffer.read()
     try:
-        snapshot = footer_snapshot(json.loads(raw), claude_parent(), time.time())
+        snapshot = footer_snapshot(json.loads(raw), claude_parent(), time.time(), account_label_for_env())
         if snapshot:
             previous = read_json(ROOT / 'sessions' / 'snapshots' / (snapshot['sessionId'] + '.json'), {})
             # Timer ticks repeat cached server data. Track capture separately from data freshness.
@@ -243,8 +294,9 @@ class TranscriptReader:
 
 
 class Collector:
-    def __init__(self, root=ROOT, home=Path.home()):
+    def __init__(self, root=ROOT, home=Path.home(), accounts=None):
         self.root, self.home = root, home
+        self.accounts = accounts if accounts is not None else claude_accounts(home)
         self.reader = TranscriptReader()
         self.previous = read_json(root / 'sessions' / 'state.json', {}).get('sessions', [])
         self.paths = {}
@@ -254,7 +306,8 @@ class Collector:
         if now - self.path_scan < 30:
             return
         self.path_scan = now
-        for tool, base in [('claude', self.home / '.claude/projects'), ('codex', self.home / '.codex/sessions')]:
+        bases = [('claude', a['dir'] / 'projects') for a in self.accounts] + [('codex', self.home / '.codex/sessions')]
+        for tool, base in bases:
             for p in base.rglob('*.jsonl'):
                 if tool == 'claude' and 'subagents' not in p.parts:
                     self.paths[(tool, p.stem)] = p
@@ -265,13 +318,14 @@ class Collector:
         now = time.time() if now is None else now
         self.refresh_paths(now)
         rows = []
-        for p in (self.home / '.claude/sessions').glob('*.json'):
+        registry = [(a, p) for a in self.accounts for p in (a['dir'] / 'sessions').glob('*.json')]
+        for account, p in registry:
             d = read_json(p, {})
             proc = proc_info(d.get('pid'))
             sid = d.get('sessionId')
             if not proc or proc['comm'] != 'claude' or not proc['tty'] or str(d.get('procStart')) != proc['start'] or not isinstance(sid, str) or not ID.fullmatch(sid):
                 continue
-            row = {'source': 'claude', 'sessionId': sid, 'pid': proc['pid'], 'procStart': proc['start'],
+            row = {'source': 'claude', 'account': account['label'], 'sessionId': sid, 'pid': proc['pid'], 'procStart': proc['start'],
                    'cwd': d.get('cwd'), 'name': d.get('name'), 'status': d.get('status') or 'running',
                    'startedAt': epoch(d.get('startedAt')), 'lastSeenAt': now}
             path = self.paths.get(('claude', sid))
@@ -287,6 +341,9 @@ class Collector:
                 row['status'] = d.get('status') or 'running'
                 # Do not overwrite an explicitly set registry name with absent footer name.
                 row['name'] = snap.get('name') or d.get('name') or transcript_name
+                row['account'] = account['label']  # The registry directory is authoritative.
+                for window in row.get('windows') or []:
+                    window['account'] = account['label']
                 # Initial capture of an old idle session is not a fresh quota response.
                 if transcript_observed:
                     for window in row.get('windows') or []:
@@ -348,22 +405,27 @@ class Collector:
                     rows.append(ended)
         rows.sort(key=lambda r: (r.get('status') == 'ended', -(r.get('observedAt') or 0)))
         windows = self.claude_windows(rows)
-        result = {'generatedAt': now, 'sessions': rows, 'claudeWindows': windows}
+        result = {'generatedAt': now, 'sessions': rows, 'claudeWindows': windows,
+                  'claudeAccounts': [a['label'] for a in self.accounts]}
         self.previous = rows
         atomic_json(self.root / 'sessions/state.json', result)
         return result
 
     def claude_windows(self, rows):
-        # Reported windows are account-wide. Select the newest report per window; never sum sessions.
-        cache = read_json(self.home / '.claude.json', {}).get('cachedUsageUtilization') or {}
-        windows = normalized_windows(cache.get('utilization'), epoch(cache.get('fetchedAtMs')), 'Claude usage cache')
+        # Reported windows are account-wide. Select the newest report per account window; never sum sessions.
+        windows = []
+        for a in self.accounts:
+            cache = read_json(a['state'], {}).get('cachedUsageUtilization') or {}
+            for w in normalized_windows(cache.get('utilization'), epoch(cache.get('fetchedAtMs')), 'Claude usage cache'):
+                windows.append(dict(w, account=a['label']))
         for row in rows:
             if row.get('source') == 'claude':
-                windows.extend(row.get('windows') or [])
+                windows.extend(dict(w, account=w.get('account') or row.get('account')) for w in row.get('windows') or [])
         latest = {}
         for w in windows:
-            if (w.get('observedAt') or 0) >= (latest.get(w['window'], {}).get('observedAt') or 0):
-                latest[w['window']] = w
+            key = (w.get('account'), w['window'])
+            if (w.get('observedAt') or 0) >= (latest.get(key, {}).get('observedAt') or 0):
+                latest[key] = w
         return list(latest.values())
 
 
